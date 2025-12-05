@@ -25,7 +25,7 @@
     <td align="center"><img src="assets/prompt.png" width="300" height="120">
       <br>Prompt Learning Framework</td> 
     <td align="center"><img src="assets/cpl.png" width="300" height="120">
-      <br>Contrastive Prompt Learning Framework</td> 
+      <br>Contrastive Prompt Learning</td> 
     </tr> 
   </table> 
 </div>

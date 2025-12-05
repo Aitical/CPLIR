@@ -6,6 +6,9 @@
 
 </div>
 
+
+
+
 <div align="center">
 <img src="assets/results.png" alt="framework" border="0">
 </div>
@@ -27,20 +30,11 @@
   </table> 
 </div>
 
-### Framework
-<div align="center">
-<img src="assets/framework.png" alt="framework" border="0">
-</div>
-
-
 ## Results
+|Benchmark|Pretrained Model| Results|
+|---|---|---|
+|WeatherBench|[Model](https://drive.google.com/file/d/1XOwUCThKIKLov2FYWtyUA0AIB3rO7E_m/view?usp=sharing)|[Results](https://drive.google.com/file/d/1kCs5XlJJvhYQuNZFgOeQWXZiR2SU-yJS/view?usp=sharing)|
 
-<div align="center">
-<img src="assets/result1.png" alt="result1" border="0"><br>
-<img src="assets/result2.png" alt="result1" border="0"><br>
-<img src="assets/result3.png" alt="result1" border="0"><br>
-<img src="assets/result4.png" alt="result1" border="0"><br>
-<img src="assets/result5.png" alt="result1" border="0"><br>
-</div>
+
 
 

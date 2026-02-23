@@ -3,14 +3,12 @@ import math
 import torch
 import torchvision
 import warnings
-from distutils.version import LooseVersion
 from itertools import repeat
 from torch import nn as nn
 from torch.nn import functional as F
 from torch.nn import init as init
 from torch.nn.modules.batchnorm import _BatchNorm
 
-from basicsr.ops.dcn import ModulatedDeformConvPack, modulated_deform_conv
 from basicsr.utils import get_root_logger
 
 
@@ -63,6 +61,10 @@ def make_layer(basic_block, num_basic_block, **kwarg):
 
 class ResidualBlockNoBN(nn.Module):
     """Residual block without BN.
+
+    It has a style of:
+        ---Conv-ReLU-Conv-+-
+         |________________|
 
     Args:
         num_feat (int): Channel number of intermediate features.
@@ -202,35 +204,6 @@ def pixel_unshuffle(x, scale):
     return x_view.permute(0, 1, 3, 5, 2, 4).reshape(b, out_channel, h, w)
 
 
-class DCNv2Pack(ModulatedDeformConvPack):
-    """Modulated deformable conv for deformable alignment.
-
-    Different from the official DCNv2Pack, which generates offsets and masks
-    from the preceding features, this DCNv2Pack takes another different
-    features to generate offsets and masks.
-
-    ``Paper: Delving Deep into Deformable Alignment in Video Super-Resolution``
-    """
-
-    def forward(self, x, feat):
-        out = self.conv_offset(feat)
-        o1, o2, mask = torch.chunk(out, 3, dim=1)
-        offset = torch.cat((o1, o2), dim=1)
-        mask = torch.sigmoid(mask)
-
-        offset_absmean = torch.mean(torch.abs(offset))
-        if offset_absmean > 50:
-            logger = get_root_logger()
-            logger.warning(f'Offset abs mean is {offset_absmean}, larger than 50.')
-
-        if LooseVersion(torchvision.__version__) >= LooseVersion('0.9.0'):
-            return torchvision.ops.deform_conv2d(x, offset, self.weight, self.bias, self.stride, self.padding,
-                                                 self.dilation, mask)
-        else:
-            return modulated_deform_conv(x, offset, mask, self.weight, self.bias, self.stride, self.padding,
-                                         self.dilation, self.groups, self.deformable_groups)
-
-
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # From: https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/layers/weight_init.py
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
@@ -311,3 +284,99 @@ to_2tuple = _ntuple(2)
 to_3tuple = _ntuple(3)
 to_4tuple = _ntuple(4)
 to_ntuple = _ntuple
+
+
+### NAFnet utils
+class LayerNormFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        ctx.eps = eps
+        N, C, H, W = x.size()
+        mu = x.mean(1, keepdim=True)
+        var = (x - mu).pow(2).mean(1, keepdim=True)
+        y = (x - mu) / (var + eps).sqrt()
+        ctx.save_for_backward(y, var, weight)
+        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        eps = ctx.eps
+
+        N, C, H, W = grad_output.size()
+        y, var, weight = ctx.saved_variables
+        g = grad_output * weight.view(1, C, 1, 1)
+        mean_g = g.mean(dim=1, keepdim=True)
+
+        mean_gy = (g * y).mean(dim=1, keepdim=True)
+        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
+        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(
+            dim=0), None
+
+class LayerNorm2d(nn.Module):
+
+    def __init__(self, channels, eps=1e-6):
+        super(LayerNorm2d, self).__init__()
+        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
+        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
+        self.eps = eps
+
+    def forward(self, x):
+        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
+
+# handle multiple input
+class MySequential(nn.Sequential):
+    def forward(self, *inputs):
+        for module in self._modules.values():
+            if type(inputs) == tuple:
+                inputs = module(*inputs)
+            else:
+                inputs = module(inputs)
+        return inputs
+
+import time
+def measure_inference_speed(model, data, max_iter=200, log_interval=50):
+    model.eval()
+
+    # the first several iterations may be very slow so skip them
+    num_warmup = 5
+    pure_inf_time = 0
+    fps = 0
+
+    # benchmark with 2000 image and take the average
+    for i in range(max_iter):
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
+        with torch.no_grad():
+            model(*data)
+
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+
+        if i >= num_warmup:
+            pure_inf_time += elapsed
+            if (i + 1) % log_interval == 0:
+                fps = (i + 1 - num_warmup) / pure_inf_time
+                print(
+                    f'Done image [{i + 1:<3}/ {max_iter}], '
+                    f'fps: {fps:.1f} img / s, '
+                    f'times per image: {1000 / fps:.1f} ms / img',
+                    flush=True)
+
+        if (i + 1) == max_iter:
+            fps = (i + 1 - num_warmup) / pure_inf_time
+            print(
+                f'Overall fps: {fps:.1f} img / s, '
+                f'times per image: {1000 / fps:.1f} ms / img',
+                flush=True)
+            break
+    return fps
+
+
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2

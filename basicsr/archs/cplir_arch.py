@@ -1,3 +1,7 @@
+# PromptIR: Prompting for All-in-One Blind Image Restoration
+# Vaishnav Potlapalli, Syed Waqas Zamir, Salman Khan, and Fahad Shahbaz Khan
+# https://arxiv.org/abs/2306.13090
+
 
 import torch
 import torch.nn as nn
@@ -6,49 +10,9 @@ import numbers
 
 from einops import rearrange
 from basicsr.utils.registry import ARCH_REGISTRY
+from basicsr.archs.arch_util import LayerNorm2d
 
 # Layer Norm
-
-
-# NAFnet utils
-class LayerNormFunction(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, x, weight, bias, eps):
-        ctx.eps = eps
-        N, C, H, W = x.size()
-        mu = x.mean(1, keepdim=True)
-        var = (x - mu).pow(2).mean(1, keepdim=True)
-        y = (x - mu) / (var + eps).sqrt()
-        ctx.save_for_backward(y, var, weight)
-        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        eps = ctx.eps
-
-        N, C, H, W = grad_output.size()
-        y, var, weight = ctx.saved_variables
-        g = grad_output * weight.view(1, C, 1, 1)
-        mean_g = g.mean(dim=1, keepdim=True)
-
-        mean_gy = (g * y).mean(dim=1, keepdim=True)
-        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
-        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(
-            dim=0), None
-
-
-class LayerNorm2d(nn.Module):
-
-    def __init__(self, channels, eps=1e-6):
-        super(LayerNorm2d, self).__init__()
-        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
-        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
-        self.eps = eps
-
-    def forward(self, x):
-        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
 
 
 def to_3d(x):
@@ -262,32 +226,89 @@ class PromptGenBlock(nn.Module):
         self.conv3x3 = nn.Conv2d(
             prompt_dim, prompt_dim, kernel_size=3, stride=1, padding=1, bias=False)
         self.num_expert = num_expert
+        self.prompt_len = prompt_len
 
-    def forward(self, x):
+    def forward(self, x, is_neg=False):
+        """
+        Args:
+            x: Input features
+            is_neg (bool): 如果为 True，则返回与当前输入不匹配的随机负样本 Prompt
+        """
         B, C, H, W = x.shape
         emb = x.mean(dim=(-2, -1))
-        prompt_weights = F.softmax(
-            self.linear_layer(emb), dim=1).to(x.dtype)
+
+        # 计算每个 Prompt 的权重
+        prompt_weights = F.softmax(self.linear_layer(emb), dim=1).to(x.dtype)
+
+        # 获取当前认为最好的 Top-K (Positive Candidates)
         topk_weights, topk_experts = torch.topk(
             prompt_weights, self.num_expert)
 
-        exp_weights = torch.zeros_like(prompt_weights)
-        exp_weights.scatter_(
-            1, topk_experts, prompt_weights.gather(1, topk_experts))
+        if not is_neg:
+            # === 正样本模式 (Normal Path) ===
+            selected_weights = prompt_weights
+            selected_experts = topk_experts
 
-        prompt = exp_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * \
-            self.prompt_param.unsqueeze(0).repeat(B, 1, 1, 1, 1, 1).squeeze(1)
+            # 构建稀疏权重矩阵
+            exp_weights = torch.zeros_like(prompt_weights)
+            exp_weights.scatter_(1, selected_experts,
+                                 selected_weights.gather(1, selected_experts))
 
-        prompt = torch.sum(prompt, dim=1)
+            # 生成 Prompt
+            prompt = self._generate_prompt(exp_weights, B)
 
-        prompt = F.interpolate(prompt, (H, W), mode="bilinear")
+        else:
+            # === 负样本模式 (Counterfactual / Negative Path) ===
+            with torch.no_grad():
+                # 1. 创建掩码：标记 Top-K 位置为 False，其他位置为 True
+                mask = torch.ones_like(prompt_weights, dtype=torch.bool)
+                mask.scatter_(1, topk_experts, False)
+
+                # 2. 生成随机噪声作为选择依据
+                noise = torch.rand_like(prompt_weights)
+
+                # 3. 将 Top-K 位置的噪声设为负无穷，确保不会被选中
+                noise.masked_fill_(~mask, -float('inf'))
+
+                # 4. 在剩余的 (非 Top-K) 候选中选取 Top-K 个作为负样本
+                _, neg_experts = torch.topk(noise, self.num_expert)
+
+                # 5. 获取负样本对应的原始权重
+                neg_weights_values = prompt_weights.gather(1, neg_experts)
+
+                # 6. 构建稀疏权重
+                exp_weights = torch.zeros_like(prompt_weights)
+                exp_weights.scatter_(1, neg_experts, neg_weights_values)
+
+                # 7. 生成 Prompt 并 Detach (确保没有梯度传回 Prompt 参数)
+                prompt = self._generate_prompt(exp_weights, B).detach()
+
+        # 后处理沿用：上采样 + 卷积
+        prompt = F.interpolate(
+            prompt, (H, W), mode="bilinear", align_corners=False)
         prompt = self.conv3x3(prompt)
 
         return prompt
 
+    def _generate_prompt(self, exp_weights, batch_size):
+        """辅助函数：根据权重组合 Prompt"""
+        # (B, prompt_len, 1, 1, 1)
+        weights = exp_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+
+        # (B, prompt_len, dim, size, size)
+        params = self.prompt_param.unsqueeze(0).repeat(
+            batch_size, 1, 1, 1, 1, 1).squeeze(1)
+
+        # Weighted sum: (B, dim, size, size)
+        prompt = torch.sum(weights * params, dim=1)
+        return prompt
+
+##########################################################################
+# ---------- PromptIR -----------------------
+
 
 @ARCH_REGISTRY.register()
-class SparsePromptIR(nn.Module):
+class CPLIR(nn.Module):
     def __init__(self,
                  inp_channels=3,
                  out_channels=3,
@@ -300,10 +321,15 @@ class SparsePromptIR(nn.Module):
                  LayerNorm_type='WithBias',  # Other option 'BiasFree'
                  decoder=False,
                  prompt_len=5,
+                 fix_backbone=False,
+                 use_uncertainty=False,
+                 privilege_post=False,
+                 fix_uncertainty=False,
                  num_expert=1
+                 #  save_path='/data_share/csgwu/paper_with_code/uclsr/model_zoo/uncertainty_aaai/prompt/ours/denoise'
                  ):
 
-        super(SparsePromptIR, self).__init__()
+        super(CPLIR, self).__init__()
 
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
         self.privilege_post = privilege_post
@@ -380,7 +406,28 @@ class SparsePromptIR(nn.Module):
         self.output = nn.Conv2d(
             int(dim*2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
-    def forward(self, inp_img):
+        self.count = 0
+
+        # self.save_path = save_path
+        self.use_uncertainty = use_uncertainty
+        if use_uncertainty:
+
+            self.var_conv = nn.Sequential(
+                nn.Conv2d(int(dim*2**1), int(dim*2**1), 3, 1, 1), nn.ELU(),
+                nn.Conv2d(int(dim*2**1), int(dim*2**1), 3, 1, 1), nn.ELU(),
+                nn.Conv2d(int(dim*2**1), out_channels, 3, 1, 1), nn.Softplus()
+            )
+            if fix_uncertainty:
+                for name, p in self.var_conv.named_parameters():
+                    p.requires_grad = False
+
+        if fix_backbone:
+            for name, p in self.named_parameters():
+                if (not 'prompt' in name) and (not 'var_conv' in name):
+                    p.requires_grad = False
+
+    def forward(self, inp_img, is_neg=False):
+        # sample_prompt = {}
 
         inp_enc_level1 = self.patch_embed(inp_img)
 
@@ -395,10 +442,11 @@ class SparsePromptIR(nn.Module):
         out_enc_level3 = self.encoder_level3(inp_enc_level3)
 
         inp_enc_level4 = self.down3_4(out_enc_level3)
+
         latent = self.latent(inp_enc_level4)
 
         if self.decoder:
-            dec3_param = self.prompt3(latent)
+            dec3_param = self.prompt3(latent, is_neg=is_neg)
             # sample_prompt['prompt3'] = dec3_param
 
             latent = torch.cat([latent, dec3_param], 1)
@@ -413,7 +461,7 @@ class SparsePromptIR(nn.Module):
         out_dec_level3 = self.decoder_level3(inp_dec_level3)
 
         if self.decoder:
-            dec2_param = self.prompt2(out_dec_level3)
+            dec2_param = self.prompt2(out_dec_level3, is_neg=is_neg)
             # sample_prompt['prompt2'] = dec2_param
 
             out_dec_level3 = torch.cat([out_dec_level3, dec2_param], 1)
@@ -427,7 +475,7 @@ class SparsePromptIR(nn.Module):
         out_dec_level2 = self.decoder_level2(inp_dec_level2)
 
         if self.decoder:
-            dec1_param = self.prompt1(out_dec_level2)
+            dec1_param = self.prompt1(out_dec_level2, is_neg=is_neg)
             # sample_prompt['prompt1'] = dec1_param
 
             out_dec_level2 = torch.cat([out_dec_level2, dec1_param], 1)
@@ -441,4 +489,9 @@ class SparsePromptIR(nn.Module):
 
         output = self.output(out_dec_level1) + inp_img
 
-        return output
+        if self.use_uncertainty:
+            un = self.var_conv(out_dec_level1)
+
+            return output, un
+        else:
+            return output
